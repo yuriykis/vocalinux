@@ -5,8 +5,10 @@ This module is responsible for injecting recognized text into the active
 application, supporting both X11 and Wayland environments.
 """
 
+import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -408,6 +410,79 @@ class TextInjector:
         except Exception as e:
             logger.debug(f"Could not show clipboard notification: {e}")
 
+    def _get_active_window_wm_class(self) -> str:
+        """Query GNOME Shell 'Windows' extension via gdbus for focused window wm_class.
+
+        Requires the 'window-calls@domandoman.xyz' (or compatible) extension.
+        Returns empty string on failure.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "gdbus", "call", "--session",
+                    "--dest=org.gnome.Shell",
+                    "--object-path=/org/gnome/Shell/Extensions/Windows",
+                    "--method=org.gnome.Shell.Extensions.Windows.List",
+                ],
+                capture_output=True, text=True, timeout=1,
+            )
+            # gdbus returns: ('[{"wm_class":"...","focus":true,...},...]',)
+            match = re.search(r"'(\[.*\])'", result.stdout, re.DOTALL)
+            if not match:
+                return ""
+            for w in json.loads(match.group(1)):
+                if w.get("focus"):
+                    return w.get("wm_class", "")
+        except Exception as e:
+            logger.debug(f"Failed to read active window wm_class: {e}")
+        return ""
+
+    def _should_use_ydotool_override(self) -> Optional[str]:
+        """Return matching wm_class if active window is in ydotool_apps override list."""
+        try:
+            from ..ui.config_manager import ConfigManager
+            patterns = (
+                ConfigManager()
+                .config.get("text_injection", {})
+                .get("ydotool_apps", [])
+            )
+            if not patterns:
+                return None
+            wm_class = self._get_active_window_wm_class()
+            if not wm_class:
+                return None
+            wm_lower = wm_class.lower()
+            for pat in patterns:
+                if pat and pat.lower() in wm_lower:
+                    return wm_class
+        except Exception as e:
+            logger.debug(f"Per-app override check failed: {e}")
+        return None
+
+    def _inject_via_ydotool_direct(self, text: str) -> bool:
+        """Inject text via ydotool, bypassing the auto-selected environment.
+
+        Used for per-app overrides. Requires ydotoold daemon running.
+        """
+        try:
+            env = os.environ.copy()
+            env.setdefault(
+                "YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket"
+            )
+            subprocess.run(
+                ["ydotool", "type", "--", text],
+                env=env, check=True, timeout=10, stderr=subprocess.PIPE,
+            )
+            logger.info("Text injection completed via per-app ydotool override")
+            return True
+        except subprocess.CalledProcessError as e:
+            stderr_msg = e.stderr.decode().strip() if e.stderr else str(e)
+            logger.error(f"ydotool override failed: {stderr_msg}")
+            return False
+        except Exception as e:
+            logger.error(f"ydotool override error: {e}")
+            return False
+
     def inject_text(self, text: str) -> bool:
         """
         Inject text into the currently focused application.
@@ -427,6 +502,17 @@ class TextInjector:
 
         # Get information about the current window/application
         self._log_current_window_info()
+
+        # Per-app override: certain apps (e.g. Warp Terminal) don't support IBus.
+        # If the focused window's wm_class matches the user's ydotool_apps list,
+        # bypass the auto-selected environment and inject directly via ydotool.
+        matched_class = self._should_use_ydotool_override()
+        if matched_class:
+            logger.info(
+                f"Per-app override active for wm_class='{matched_class}' "
+                "→ using direct ydotool injection"
+            )
+            return self._inject_via_ydotool_direct(text)
 
         # Note: No shell escaping needed - subprocess is called with list arguments,
         # which passes text directly without shell interpretation

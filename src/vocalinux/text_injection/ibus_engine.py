@@ -268,7 +268,7 @@ def is_engine_active() -> bool:
             ["ibus", "engine"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=15,
         )
         return result.returncode == 0 and ENGINE_NAME in result.stdout.strip()
     except (subprocess.SubprocessError, FileNotFoundError):
@@ -284,7 +284,7 @@ def get_current_engine() -> Optional[str]:
             ["ibus", "engine"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=15,
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -400,7 +400,7 @@ def switch_engine(engine_name: str) -> bool:
             ["ibus", "engine", engine_name],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=15,
         )
         # ibus engine command may return non-zero even on success
         # So we verify by checking the current engine

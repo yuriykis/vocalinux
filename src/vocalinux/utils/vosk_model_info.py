@@ -47,6 +47,11 @@ SUPPORTED_LANGUAGES = {
         "whisper": "ru",
         "vosk": "vosk-model-small-ru-0.22",
     },
+    "pl": {
+        "name": "Polish",
+        "whisper": "pl",
+        "vosk": "vosk-model-small-pl-0.22",
+    },
     "zh": {
         "name": "Chinese",
         "whisper": "zh",
@@ -72,6 +77,7 @@ VOSK_MODEL_INFO = {
             "it": "vosk-model-small-it-0.22",
             "pt": "vosk-model-small-pt-0.3",
             "ru": "vosk-model-small-ru-0.22",
+            "pl": "vosk-model-small-pl-0.22",
             "zh": "vosk-model-small-cn-0.22",
         },
     },
