@@ -581,6 +581,49 @@ class TestTextInjector(unittest.TestCase):
                 "Should NOT invoke clipboard for ASCII text",
             )
 
+    def test_override_prefers_captured_wm_class_over_live_query(self):
+        """Captured wm_class beats a live gdbus query that may return wrong window.
+
+        Why this matters: a critical-urgency notification banner from the
+        recording overlay can shift GNOME's reported focus mid-injection, so
+        a live `_get_active_window_wm_class()` may no longer return the user's
+        editor. The wm_class captured at LISTENING time must win.
+        """
+        with patch("vocalinux.text_injection.text_injector.shutil.which"), \
+             patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            injector = TextInjector()
+
+        injector._target_wm_class = "dev.warp.Warp"
+
+        with patch.object(
+            injector, "_get_active_window_wm_class", return_value="something.Else"
+        ) as live_query, patch(
+            "vocalinux.ui.config_manager.ConfigManager"
+        ) as cfg:
+            cfg.return_value.config = {"text_injection": {"ydotool_apps": ["dev.warp.Warp"]}}
+            match = injector._should_use_ydotool_override()
+
+        self.assertEqual(match, "dev.warp.Warp")
+        live_query.assert_not_called()
+
+    def test_override_falls_back_to_live_query_when_no_capture(self):
+        """If capture_target_window never ran (or captured nothing), use live query."""
+        with patch("vocalinux.text_injection.text_injector.shutil.which"), \
+             patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            injector = TextInjector()
+
+        injector._target_wm_class = None
+
+        with patch.object(
+            injector, "_get_active_window_wm_class", return_value="dev.warp.Warp"
+        ), patch(
+            "vocalinux.ui.config_manager.ConfigManager"
+        ) as cfg:
+            cfg.return_value.config = {"text_injection": {"ydotool_apps": ["dev.warp.Warp"]}}
+            match = injector._should_use_ydotool_override()
+
+        self.assertEqual(match, "dev.warp.Warp")
+
     @patch("vocalinux.text_injection.text_injector.shutil.which")
     @patch("vocalinux.text_injection.text_injector.subprocess.run")
     def test_ydotool_override_unicode_saves_and_restores_clipboard(self, mock_run, mock_which):

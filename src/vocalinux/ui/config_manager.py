@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
     "ui": {
         "start_minimized": False,
         "show_notifications": True,
+        "show_recording_overlay": True,
     },
     "general": {
         "autostart": False,

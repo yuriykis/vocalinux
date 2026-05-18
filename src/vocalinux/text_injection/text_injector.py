@@ -54,6 +54,7 @@ class TextInjector:
         """
         self._ibus_injector: Optional[IBusTextInjector] = None
         self._target_x11_window_id: Optional[str] = None
+        self._target_wm_class: Optional[str] = None
         self.preferred_tool = self._get_preferred_tool()
         self.environment = self._detect_environment()
 
@@ -142,7 +143,20 @@ class TextInjector:
         )
 
     def capture_target_window(self) -> None:
-        """Remember the currently focused X11/XWayland window for delayed injection."""
+        """Remember the currently focused window for delayed injection.
+
+        Captures two pieces of info:
+          * X11 window ID (xdotool) — only meaningful on X11/XWayland paths.
+          * wm_class via GNOME Shell Windows extension — used by the per-app
+            ydotool override so we don't have to query focus at injection time
+            (by then a notification banner may have stolen focus).
+        """
+        # Always reset; stale values from a previous session must not leak.
+        self._target_x11_window_id = None
+        self._target_wm_class = self._get_active_window_wm_class() or None
+        if self._target_wm_class:
+            logger.info(f"Captured target wm_class: {self._target_wm_class}")
+
         env = os.environ.copy()
         if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
             env["GDK_BACKEND"] = "x11"
@@ -150,7 +164,6 @@ class TextInjector:
             if "DISPLAY" not in env or not env["DISPLAY"]:
                 env["DISPLAY"] = ":0"
         if self.environment not in {DesktopEnvironment.X11, DesktopEnvironment.WAYLAND_XDOTOOL}:
-            self._target_x11_window_id = None
             return
         try:
             result = subprocess.run(
@@ -166,7 +179,6 @@ class TextInjector:
             if self._target_x11_window_id:
                 logger.info(f"Captured target X11 window: {self._target_x11_window_id}")
         except Exception as e:
-            self._target_x11_window_id = None
             logger.debug(f"Could not capture target X11 window: {e}")
 
     def _detect_environment(self) -> DesktopEnvironment:
@@ -574,14 +586,21 @@ class TextInjector:
         return ""
 
     def _should_use_ydotool_override(self) -> Optional[str]:
-        """Return matching wm_class if active window is in ydotool_apps override list."""
+        """Return matching wm_class if active window is in ydotool_apps override list.
+
+        Prefers the wm_class captured at LISTENING time, falling back to a live
+        gdbus query. This matters when a critical-urgency notification banner
+        (e.g. the recording overlay) is on screen during injection: GNOME may
+        report a different "focused" window than the user's actual editor, so a
+        live query would miss the override.
+        """
         try:
             from ..ui.config_manager import ConfigManager
 
             patterns = ConfigManager().config.get("text_injection", {}).get("ydotool_apps", [])
             if not patterns:
                 return None
-            wm_class = self._get_active_window_wm_class()
+            wm_class = self._target_wm_class or self._get_active_window_wm_class()
             if not wm_class:
                 return None
             wm_lower = wm_class.lower()

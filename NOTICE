@@ -1,0 +1,24 @@
+Vocalinux
+Copyright (C) the Vocalinux contributors
+
+This product includes third-party material distributed under compatible
+free-software licenses. Per the requirements of GPL-3.0 §5, the original
+copyright notices for those materials are preserved here.
+
+------------------------------------------------------------------------
+VoiceInk — sound effects
+------------------------------------------------------------------------
+Files:
+  resources/sounds/start_recording.wav
+  resources/sounds/stop_recording.wav
+  src/vocalinux/resources/sounds/start_recording.wav
+  src/vocalinux/resources/sounds/stop_recording.wav
+
+Adapted from VoiceInk by Beingpax:
+  https://github.com/Beingpax/VoiceInk
+  Original files: VoiceInk/Resources/Sounds/recstart.mp3, recstop.mp3
+  License: GNU General Public License v3.0
+  Copyright (C) Beingpax
+
+The original MP3 files were transcoded to WAV (16-bit PCM, mono, 44.1 kHz)
+to match Vocalinux's audio pipeline. No editorial changes were made.

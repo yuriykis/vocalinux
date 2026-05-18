@@ -432,6 +432,13 @@ def main():
         speech_engine.register_action_callback(action_handler.handle_action)
         speech_engine.register_state_callback(on_state_change)
 
+        ui_settings = config_manager.get_settings().get("ui", {})
+        if ui_settings.get("show_recording_overlay", True):
+            from .ui.recording_overlay import RecordingOverlay
+
+            recording_overlay = RecordingOverlay()
+            speech_engine.register_state_callback(recording_overlay.on_state_change)
+
         # Initialize and start the system tray indicator
         indicator = tray_indicator.TrayIndicator(
             speech_engine=speech_engine,
