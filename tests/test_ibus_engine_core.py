@@ -483,8 +483,18 @@ class TestIBusTextInjector(unittest.TestCase):
     @patch("vocalinux.text_injection.ibus_engine.SOCKET_PATH")
     @patch("vocalinux.text_injection.ibus_engine.start_engine_process", return_value=True)
     @patch("vocalinux.text_injection.ibus_engine.is_engine_active", return_value=True)
+    @patch("vocalinux.text_injection.ibus_engine.switch_engine", return_value=True)
+    @patch("vocalinux.text_injection.ibus_engine.get_current_engine", return_value=None)
+    @patch("vocalinux.text_injection.ibus_engine.get_current_xkb_layout", return_value=("us", "", ""))
     def test_ibus_text_injector_init_with_auto_activate(
-        self, mock_active, mock_start, mock_socket_path, mock_ensure_dir
+        self,
+        mock_xkb,
+        mock_current,
+        mock_switch,
+        mock_active,
+        mock_start,
+        mock_socket_path,
+        mock_ensure_dir,
     ):
         """Test IBusTextInjector initialization with auto-activation."""
         from vocalinux.text_injection.ibus_engine import IBusTextInjector
@@ -779,25 +789,6 @@ class TestVocalinuxEngineApplication(unittest.TestCase):
 
 class TestIBusEngineMainEntrypoint(unittest.TestCase):
     """Test ibus_engine.main() flag handling."""
-
-    def test_main_xml_flag_prints_engines_and_exits(self):
-        """Test --xml path prints engines XML and exits early."""
-        from vocalinux.text_injection import ibus_engine
-
-        with (
-            patch.object(sys, "argv", ["ibus_engine.py", "--xml"]),
-            patch.object(
-                ibus_engine, "_get_engines_xml", return_value="<engines></engines>"
-            ) as mock_get_xml,
-            patch("builtins.print") as mock_print,
-            patch.object(ibus_engine.IBus, "init") as mock_init,
-        ):
-            result = ibus_engine.main()
-
-        self.assertEqual(result, 0)
-        mock_get_xml.assert_called_once_with()
-        mock_print.assert_called_once_with("<engines></engines>")
-        mock_init.assert_not_called()
 
     def test_main_passes_ibus_flag_to_application(self):
         """Test --ibus path initializes application in IBus exec mode."""

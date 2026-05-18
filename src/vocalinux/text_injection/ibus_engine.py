@@ -68,8 +68,8 @@ ENGINE_LONGNAME = "Vocalinux"
 ENGINE_DESCRIPTION = "Vocalinux voice dictation (use as default input method)"
 COMPONENT_NAME = "org.freedesktop.IBus.Vocalinux"
 
-# Shared metadata used by component XML, --xml output, and runtime registration.
-# Kept in one place to prevent drift between the three consumers.
+# Runtime D-Bus registration metadata (passed as kwargs to IBus.Component
+# and IBus.EngineDesc when standalone-mode register_component() is called).
 ENGINE_RANK = 50
 _ENGINE_META = {
     "language": "other",
@@ -494,30 +494,94 @@ def start_engine_process() -> bool:
         return False
 
 
-def stop_engine_process() -> None:
-    """Stop the IBus engine process if running."""
+def _find_engine_processes(exclude_pids: tuple = ()) -> list:
+    """Find all running vocalinux IBus engine processes by scanning /proc.
+
+    Catches orphans launched by ibus-daemon from a different vocalinux
+    installation (e.g. an older venv) or leftover from a previous session
+    whose PID file is gone. These hold the IBus D-Bus name and would prevent
+    a fresh engine from receiving do_enable, leaving the inject socket missing.
+    """
+    found = []
+    my_pid = os.getpid()
     try:
-        if not PID_FILE.exists():
-            logger.debug("No PID file found, engine not running")
-            return
+        entries = os.listdir("/proc")
+    except OSError as e:
+        logger.debug(f"Failed to list /proc: {e}")
+        return found
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == my_pid or pid in exclude_pids:
+            continue
+        try:
+            cmdline = (Path("/proc") / entry / "cmdline").read_text()
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        if "ibus_engine.py" in cmdline and "vocalinux" in cmdline:
+            found.append(pid)
+    return found
 
-        pid = int(PID_FILE.read_text().strip())
-        # Verify it's our process before killing
-        cmdline_path = Path(f"/proc/{pid}/cmdline")
-        if cmdline_path.exists():
-            cmdline = cmdline_path.read_text()
-            if "ibus_engine.py" not in cmdline or "vocalinux" not in cmdline:
-                logger.warning(f"PID {pid} is not our engine process, skipping kill")
-                PID_FILE.unlink()
-                return
 
+def _kill_pid(pid: int) -> None:
+    """SIGTERM a PID, escalate to SIGKILL if it doesn't exit within 1s."""
+    try:
         os.kill(pid, signal.SIGTERM)
-        logger.info(f"IBus engine process (PID {pid}) stopped")
-        PID_FILE.unlink()
+    except OSError:
+        return
+    for _ in range(10):
+        try:
+            os.kill(pid, 0)
+            time.sleep(0.1)
+        except OSError:
+            return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def stop_engine_process() -> None:
+    """Stop the IBus engine process and any stale orphans."""
+    tracked_pid: Optional[int] = None
+    try:
+        if PID_FILE.exists():
+            try:
+                tracked_pid = int(PID_FILE.read_text().strip())
+            except (OSError, ValueError):
+                tracked_pid = None
+
+            if tracked_pid is not None:
+                cmdline_path = Path(f"/proc/{tracked_pid}/cmdline")
+                if cmdline_path.exists():
+                    cmdline = cmdline_path.read_text()
+                    if "ibus_engine.py" in cmdline and "vocalinux" in cmdline:
+                        _kill_pid(tracked_pid)
+                        logger.info(f"IBus engine process (PID {tracked_pid}) stopped")
+                    else:
+                        logger.warning(
+                            f"PID {tracked_pid} is not our engine process, skipping kill"
+                        )
+                        tracked_pid = None
+            PID_FILE.unlink(missing_ok=True)
+
+        # Clean up any orphan engine processes (e.g. from a different
+        # vocalinux installation that ibus-daemon spawned).
+        orphans = _find_engine_processes(exclude_pids=(tracked_pid,) if tracked_pid else ())
+        for pid in orphans:
+            logger.info(f"Killing stale IBus engine orphan: PID {pid}")
+            _kill_pid(pid)
+
+        # Drop a stale socket inode so the next engine can bind fresh.
+        if SOCKET_PATH.exists():
+            try:
+                SOCKET_PATH.unlink()
+            except OSError as e:
+                logger.debug(f"Could not unlink stale socket: {e}")
     except (OSError, ValueError, FileNotFoundError) as e:
         logger.debug(f"Failed to stop IBus engine process: {e}")
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        PID_FILE.unlink(missing_ok=True)
 
 
 class VocalinuxEngine(IBus.Engine if IBUS_AVAILABLE else object):
@@ -746,10 +810,6 @@ class VocalinuxEngineApplication:
 
         logger.info("Vocalinux IBus engine started")
 
-        # Start the socket server immediately so it's ready for connections
-        # even before the engine is activated via `ibus engine vocalinux`
-        VocalinuxEngine._start_socket_server()
-
     def _on_disconnected(self, bus: "IBus.Bus") -> None:
         """Handle IBus disconnection."""
         logger.info("IBus disconnected, exiting")
@@ -794,27 +854,17 @@ class IBusTextInjector:
 
     def _setup_engine(self) -> None:
         """Install and activate the IBus engine."""
-        # Start the engine process — it calls register_component() via
-        # D-Bus which makes the engine available even when the IBus daemon
-        # doesn't scan ~/.local/share/ibus/component/.
-        # Follow-up to PR #304: register_component() is the reliable path,
-        # so we no longer gate on is_engine_registered() / ibus list-engine.
+        if SOCKET_PATH.exists():
+            SOCKET_PATH.unlink()
+        stop_engine_process()
+
+        # Start the engine process — it calls register_component() via D-Bus
+        # which makes the engine available to the running ibus-daemon. No
+        # static XML is installed: ibus-daemon used to spawn the engine on its
+        # own from a stale exec command in the XML, creating orphan processes
+        # that conflicted with our own start.
         if not start_engine_process():
             raise IBusSetupError("Failed to start IBus engine process. Check logs for details.")
-
-        # Verify the engine is fully ready before proceeding.
-        # start_engine_process() only confirms the subprocess is alive —
-        # register_component() and socket setup may still be in progress.
-        for _attempt in range(15):
-            if SOCKET_PATH.exists():
-                logger.debug("Engine socket is ready")
-                break
-            time.sleep(0.2)
-        else:
-            logger.warning(
-                "Engine process started but socket not ready after retries; "
-                "proceeding with activation attempt"
-            )
 
         # Capture current XKB layout before switching engines
         # This is critical for preserving the user's keyboard layout
@@ -826,19 +876,34 @@ class IBusTextInjector:
         )
 
         # Save current engine and switch to Vocalinux
-        if not is_engine_active():
-            self._previous_engine = get_current_engine()
-            if self._previous_engine:
-                logger.info(f"Saving current engine: {self._previous_engine}")
+        self._previous_engine = get_current_engine()
+        if self._previous_engine:
+            logger.info(f"Saving current engine: {self._previous_engine}")
 
-            logger.info("Activating Vocalinux IBus engine...")
+        if self._previous_engine == ENGINE_NAME:
+            fallback_engine = "xkb:us::eng"
+            logger.info(f"Switching away from stale Vocalinux engine to {fallback_engine}")
+            switch_engine(fallback_engine)
+
+        logger.info("Activating Vocalinux IBus engine...")
+        # After a fresh `ibus restart` the engine subprocess needs time to
+        # finish Python startup and call register_component() over D-Bus
+        # before switch_engine() will find it. Poll with backoff.
+        activation_deadline = time.monotonic() + 10.0
+        activated = False
+        attempt = 0
+        while time.monotonic() < activation_deadline:
+            attempt += 1
             if switch_engine(ENGINE_NAME):
-                logger.info("Vocalinux IBus engine activated")
-            else:
-                raise IBusSetupError(
-                    "Failed to activate Vocalinux IBus engine. "
-                    "Try manually: ibus engine vocalinux"
-                )
+                activated = True
+                logger.info(f"Vocalinux IBus engine activated (attempt {attempt})")
+                break
+            time.sleep(0.5)
+        if not activated:
+            raise IBusSetupError(
+                "Failed to activate Vocalinux IBus engine. "
+                "Try manually: ibus engine vocalinux"
+            )
 
         # Restore the user's XKB layout immediately after engine activation.
         # Switching to the Vocalinux IBus engine can override the system
@@ -894,12 +959,15 @@ class IBusTextInjector:
             logger.debug("Vocalinux engine not active, re-activating...")
             switch_engine(ENGINE_NAME)
 
+        for _attempt in range(25):
+            if SOCKET_PATH.exists():
+                break
+            time.sleep(0.2)
+        else:
+            logger.error("IBus engine socket not found after activation")
+            return False
+
         try:
-            if not SOCKET_PATH.exists():
-                logger.error(
-                    "IBus engine socket not found. " "Make sure Vocalinux IBus engine is running."
-                )
-                return False
 
             # Connect to engine socket and send text
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -927,41 +995,8 @@ class IBusTextInjector:
             return False
 
 
-def _get_engines_xml() -> str:
-    """Return engine XML for IBus --xml discovery.
-
-    IBus invokes ``<exec> --xml`` during ``ibus write-cache`` and
-    ``ibus list-engine`` to discover available engines.  The expected
-    output is a bare ``<engines>`` block printed to stdout.
-    """
-    e = _ENGINE_META
-
-    return f"""<engines>
-    <engine>
-        <name>{ENGINE_NAME}</name>
-        <longname>{ENGINE_LONGNAME}</longname>
-        <language>{e['language']}</language>
-        <license>{e['license']}</license>
-        <author>{e['author']}</author>
-        <icon>{e['icon']}</icon>
-        <layout>{e['layout']}</layout>
-        <layout_variant />
-        <layout_option />
-        <description>{ENGINE_DESCRIPTION}</description>
-        <rank>{ENGINE_RANK}</rank>
-    </engine>
-</engines>"""
-
-
 def main():
     """Entry point when run as IBus engine process."""
-    # IBus calls the exec with --xml to discover engines during
-    # ibus write-cache and ibus list-engine.  Respond and exit
-    # immediately — do not enter the GLib main loop.
-    if "--xml" in sys.argv:
-        print(_get_engines_xml())
-        return 0
-
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

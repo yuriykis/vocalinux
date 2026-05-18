@@ -44,3 +44,11 @@ class TextInjectorProtocol(Protocol):
     def inject_text(self, text: str) -> bool:
         """Inject text into the active application."""
         ...
+
+    def reconfigure(self, preferred_tool: Optional[str] = None) -> None:
+        """Reload text injection settings."""
+        ...
+
+    def capture_target_window(self) -> None:
+        """Remember the currently focused target window."""
+        ...

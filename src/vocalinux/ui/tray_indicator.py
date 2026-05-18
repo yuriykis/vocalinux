@@ -470,6 +470,7 @@ class TrayIndicator:
             config_manager=self.config_manager,
             speech_engine=self.speech_engine,
             shortcut_update_callback=self.update_shortcut,
+            text_injection_update_callback=self.update_text_injection_tool,
         )
 
         # Connect to the response signal
@@ -488,6 +489,16 @@ class TrayIndicator:
         # Create and show the logging dialog
         dialog = LoggingDialog(parent=None)
         dialog.show()
+
+    def update_text_injection_tool(self, preferred_tool: str) -> bool:
+        """Update the active text injection tool without requiring restart."""
+        try:
+            if hasattr(self.text_injector, "reconfigure"):
+                self.text_injector.reconfigure(preferred_tool)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update text injection tool: {e}")
+            return False
 
     def _on_settings_dialog_response(self, dialog, response):
         """Handle responses from the settings dialog."""

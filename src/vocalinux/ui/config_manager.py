@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     },
     "text_injection": {
         "copy_to_clipboard": False,  # Disabled by default; users can enable in Settings
+        "preferred_tool": "auto",
         # Per-application injection override.
         # Apps whose wm_class matches any of these patterns (case-insensitive substring)
         # will use ydotool (uinput-level keyboard simulation) instead of the default

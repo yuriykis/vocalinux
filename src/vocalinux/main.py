@@ -425,6 +425,7 @@ def main():
             """Reset the last-injected buffer when a new listening session starts."""
             if state == RecognitionState.LISTENING:
                 action_handler.set_last_injected_text("")
+                text_system.capture_target_window()
 
         # Connect speech recognition to text injection and action handling
         speech_engine.register_text_callback(text_callback_wrapper)

@@ -724,6 +724,7 @@ class SettingsDialog(Gtk.Dialog):
         config_manager: "ConfigManager",
         speech_engine: "SpeechRecognitionManager",
         shortcut_update_callback: callable = None,
+        text_injection_update_callback: callable = None,
     ):
         super().__init__(title="Vocalinux Settings", transient_for=parent, flags=0)
         self.set_decorated(True)  # Force window decorations (close button) on all WMs
@@ -735,6 +736,7 @@ class SettingsDialog(Gtk.Dialog):
         self.config_manager = config_manager
         self.speech_engine = speech_engine
         self.shortcut_update_callback = shortcut_update_callback
+        self.text_injection_update_callback = text_injection_update_callback
         self._test_active = False
         self._test_result = ""
         self._initializing = True  # Flag to prevent auto-apply during initialization
@@ -976,11 +978,32 @@ class SettingsDialog(Gtk.Dialog):
         )
         group.add_row(copy_to_clipboard_row)
 
+        self.text_injection_tool_combo = Gtk.ComboBoxText()
+        self.text_injection_tool_combo.set_size_request(180, -1)
+        self.text_injection_tool_combo.set_tooltip_text(
+            "Choose the preferred text injection tool. Auto keeps the default fallback order."
+        )
+        for tool_id, label in [
+            ("auto", "Auto"),
+            ("ibus", "IBus"),
+            ("xdotool", "xdotool"),
+            ("ydotool", "ydotool"),
+            ("wtype", "wtype"),
+        ]:
+            self.text_injection_tool_combo.append(tool_id, label)
+        text_injection_tool_row = PreferenceRow(
+            title="Text Injection Tool",
+            subtitle="Preferred tool for typing recognized text",
+            widget=self.text_injection_tool_combo,
+        )
+        group.add_row(text_injection_tool_row)
+
         self.general_tab.pack_start(group, False, False, 0)
 
         self.autostart_switch.connect("state-set", self._on_autostart_toggled)
         self.start_minimized_switch.connect("state-set", self._on_start_minimized_toggled)
         self.copy_to_clipboard_switch.connect("state-set", self._on_copy_to_clipboard_toggled)
+        self.text_injection_tool_combo.connect("changed", self._on_text_injection_tool_changed)
 
     def _on_autostart_toggled(self, widget, state):
         """Handle toggle of the autostart switch."""
@@ -1023,6 +1046,18 @@ class SettingsDialog(Gtk.Dialog):
         self.config_manager.save_settings()
         logger.info(f"Copy to clipboard {'enabled' if enabled else 'disabled'}")
         return False
+
+    def _on_text_injection_tool_changed(self, widget):
+        """Handle text injection tool selection changes."""
+        if self._initializing or self._applying_settings:
+            return
+
+        tool = widget.get_active_id() or "auto"
+        logger.info(f"Text injection tool changed: {tool}")
+        self.config_manager.set("text_injection", "preferred_tool", tool)
+        self.config_manager.save_settings()
+        if self.text_injection_update_callback:
+            self.text_injection_update_callback(tool)
 
     def _on_sound_effects_toggled(self, widget, state):
         if self._initializing or self._applying_settings:
@@ -1456,10 +1491,13 @@ class SettingsDialog(Gtk.Dialog):
         autostart_enabled = general_settings.get("autostart", False)
         start_minimized = ui_settings.get("start_minimized", False)
         copy_to_clipboard = text_injection_settings.get("copy_to_clipboard", False)
+        preferred_tool = text_injection_settings.get("preferred_tool", "auto")
 
         self.autostart_switch.set_active(autostart_enabled)
         self.start_minimized_switch.set_active(start_minimized)
         self.copy_to_clipboard_switch.set_active(copy_to_clipboard)
+        if not self.text_injection_tool_combo.set_active_id(preferred_tool):
+            self.text_injection_tool_combo.set_active_id("auto")
         self.sound_effects_switch.set_active(self.config_manager.is_sound_effects_enabled())
 
         # Populate engine combo with only available engines

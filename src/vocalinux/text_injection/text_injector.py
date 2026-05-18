@@ -53,6 +53,8 @@ class TextInjector:
             wayland_mode: Force Wayland compatibility mode
         """
         self._ibus_injector: Optional[IBusTextInjector] = None
+        self._target_x11_window_id: Optional[str] = None
+        self.preferred_tool = self._get_preferred_tool()
         self.environment = self._detect_environment()
 
         # Force Wayland mode if requested
@@ -112,6 +114,61 @@ class TextInjector:
             self._ibus_injector.stop()
             self._ibus_injector = None
 
+    def _get_preferred_tool(self) -> str:
+        """Get preferred text injection tool from config."""
+        try:
+            from ..ui.config_manager import ConfigManager
+
+            tool = str(ConfigManager().get("text_injection", "preferred_tool", "auto"))
+            if tool in {"auto", "ibus", "xdotool", "ydotool", "wtype"}:
+                return tool
+            logger.warning(f"Unknown preferred text injection tool '{tool}', using auto")
+        except Exception as e:
+            logger.debug(f"Could not read preferred text injection tool: {e}")
+        return "auto"
+
+    def reconfigure(self, preferred_tool: Optional[str] = None) -> None:
+        """Reload text injection dependencies after configuration changes."""
+        if self._ibus_injector:
+            self._ibus_injector.stop()
+            self._ibus_injector = None
+        self.preferred_tool = preferred_tool or self._get_preferred_tool()
+        self.environment = self._detect_environment()
+        self._check_dependencies()
+        logger.info(
+            f"Text injection reconfigured: environment={self.environment.value}, "
+            f"preferred_tool={self.preferred_tool}, "
+            f"wayland_tool={getattr(self, 'wayland_tool', None)}"
+        )
+
+    def capture_target_window(self) -> None:
+        """Remember the currently focused X11/XWayland window for delayed injection."""
+        env = os.environ.copy()
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            env["GDK_BACKEND"] = "x11"
+            env["QT_QPA_PLATFORM"] = "xcb"
+            if "DISPLAY" not in env or not env["DISPLAY"]:
+                env["DISPLAY"] = ":0"
+        if self.environment not in {DesktopEnvironment.X11, DesktopEnvironment.WAYLAND_XDOTOOL}:
+            self._target_x11_window_id = None
+            return
+        try:
+            result = subprocess.run(
+                ["xdotool", "getactivewindow"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=1,
+            )
+            self._target_x11_window_id = result.stdout.strip() or None
+            if self._target_x11_window_id:
+                logger.info(f"Captured target X11 window: {self._target_x11_window_id}")
+        except Exception as e:
+            self._target_x11_window_id = None
+            logger.debug(f"Could not capture target X11 window: {e}")
+
     def _detect_environment(self) -> DesktopEnvironment:
         """
         Detect the current desktop environment (X11 or Wayland).
@@ -138,7 +195,7 @@ class TextInjector:
         """Check for the required tools for text injection."""
         # Prefer IBus on both X11 and Wayland - it sends Unicode directly,
         # bypassing keyboard layout issues entirely
-        if is_ibus_available():
+        if self.preferred_tool in {"auto", "ibus"} and is_ibus_available():
             # Check if IBus is the active input method (not just installed)
             # This is important because IBus may be installed but not being used,
             # e.g., when the user has configured ydotool or Fcitx instead
@@ -166,6 +223,9 @@ class TextInjector:
                     )
                     return
                 except Exception as e:
+                    if self.preferred_tool == "ibus":
+                        logger.error(f"IBus initialization failed: {e}")
+                        raise RuntimeError("Preferred IBus text injection failed") from e
                     logger.warning(f"IBus initialization failed: {e}, trying alternatives")
         if self.environment == DesktopEnvironment.X11:
             # Check for xdotool
@@ -173,58 +233,61 @@ class TextInjector:
                 logger.error("xdotool not found. Please install it with: sudo apt install xdotool")
                 raise RuntimeError("Missing required dependency: xdotool")
         else:
-            # Fallback: Check for wtype or ydotool for Wayland
-            wtype_available = shutil.which("wtype") is not None
-            ydotool_available = shutil.which("ydotool") is not None
-            xdotool_available = shutil.which("xdotool") is not None
+            tools = {
+                "wtype": shutil.which("wtype") is not None,
+                "ydotool": shutil.which("ydotool") is not None,
+                "xdotool": shutil.which("xdotool") is not None,
+            }
+            order = ["ydotool", "wtype", "xdotool"]
+            if self.preferred_tool in tools:
+                order = [self.preferred_tool] + [
+                    tool for tool in order if tool != self.preferred_tool
+                ]
+                logger.info(f"Preferred Wayland text injection tool: {self.preferred_tool}")
 
-            if ydotool_available:
-                # Verify ydotoold daemon is running before selecting ydotool
-                try:
-                    subprocess.run(
-                        ["ydotool", "type", ""],
-                        check=True,
-                        stderr=subprocess.PIPE,
-                        timeout=2,
-                    )
-                    self.wayland_tool = "ydotool"
-                    logger.info(f"Using {self.wayland_tool} for Wayland text injection")
-                except (
-                    subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired,
-                    FileNotFoundError,
-                ):
-                    if wtype_available:
-                        self.wayland_tool = "wtype"
-                        logger.info(
-                            f"Using {self.wayland_tool} for Wayland text injection (ydotoold not running)"
+            for tool in order:
+                if not tools[tool]:
+                    continue
+                if tool == "ydotool":
+                    try:
+                        subprocess.run(
+                            ["ydotool", "type", ""],
+                            check=True,
+                            stderr=subprocess.PIPE,
+                            timeout=2,
                         )
-                    else:
+                        self.wayland_tool = "ydotool"
+                        logger.info(f"Using {self.wayland_tool} for Wayland text injection")
+                        return
+                    except (
+                        subprocess.CalledProcessError,
+                        subprocess.TimeoutExpired,
+                        FileNotFoundError,
+                    ):
                         logger.warning("ydotool found but ydotoold daemon not running")
-            elif wtype_available:
-                self.wayland_tool = "wtype"
-                logger.info(f"Using {self.wayland_tool} for Wayland text injection")
-            elif xdotool_available:
-                # Fallback to xdotool with XWayland
-                self.environment = DesktopEnvironment.WAYLAND_XDOTOOL
-                logger.info(
-                    "No native Wayland tools found. Using xdotool with XWayland as fallback"
-                )
-            else:
-                logger.error(
-                    "No text injection tools found. Please install one of:\n"
-                    "- IBus (recommended, usually pre-installed)\n"
-                    "- wtype: sudo apt install wtype (GNOME/Sway)\n"
-                    "- ydotool: sudo apt install ydotool (works on all Wayland compositors)\n"
-                    "- xdotool: sudo apt install xdotool (X11/XWayland only)\n"
-                    "\n"
-                    "For KDE Plasma Wayland users: wtype is not supported. "
-                    "Install ydotool or wl-copy for clipboard fallback:\n"
-                    "  sudo apt install ydotool\n"
-                    "  sudo systemctl enable --now ydotoold\n"
-                    "Or for clipboard fallback: sudo apt install wl-copy"
-                )
-                raise RuntimeError("Missing required dependencies for text injection")
+                        continue
+                if tool == "wtype":
+                    self.wayland_tool = "wtype"
+                    logger.info(f"Using {self.wayland_tool} for Wayland text injection")
+                    return
+                if tool == "xdotool":
+                    self.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+                    logger.info("Using xdotool with XWayland for Wayland text injection")
+                    return
+
+            logger.error(
+                "No text injection tools found. Please install one of:\n"
+                "- IBus (recommended, usually pre-installed)\n"
+                "- wtype: sudo apt install wtype (GNOME/Sway)\n"
+                "- ydotool: sudo apt install ydotool (works on all Wayland compositors)\n"
+                "- xdotool: sudo apt install xdotool (X11/XWayland only)\n"
+                "\n"
+                "For KDE Plasma Wayland users: wtype is not supported. "
+                "Install ydotool:\n"
+                "  sudo apt install ydotool\n"
+                "  sudo systemctl enable --now ydotoold"
+            )
+            raise RuntimeError("Missing required dependencies for text injection")
 
     def _test_xdotool_fallback(self):
         """Test if xdotool is working correctly with XWayland."""
@@ -267,6 +330,11 @@ class TextInjector:
             True if a better tool was found and environment was updated, False otherwise
         """
         if self.environment != DesktopEnvironment.WAYLAND_XDOTOOL:
+            return False
+        if self.preferred_tool != "auto":
+            logger.debug(
+                f"Not recovering from XWayland fallback because preferred_tool={self.preferred_tool}"
+            )
             return False
 
         logger.info("Checking for better Wayland text injection tools...")
@@ -324,29 +392,34 @@ class TextInjector:
         """
         logger.info("Copying text to clipboard")
 
-        # Try wl-copy first (Wayland native)
+        # NOTE: wl-copy/xclip/xsel fork a daemon to serve clipboard reads.
+        # The daemon inherits stdout/stderr from us. If we pass stderr=PIPE,
+        # the daemon keeps the pipe open and subprocess.run blocks until timeout.
+        # Redirect to DEVNULL so the daemon has nothing to keep open.
         if shutil.which("wl-copy"):
             try:
                 subprocess.run(
-                    ["wl-copy", text],
+                    ["wl-copy"],
+                    input=text,
                     check=True,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     text=True,
-                    timeout=5,
+                    timeout=2,
                 )
                 logger.info("Text copied to Wayland clipboard using wl-copy")
                 return True
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 logger.warning(f"wl-copy failed: {e}")
 
-        # Try xclip (X11 / XWayland)
         if shutil.which("xclip"):
             try:
                 subprocess.run(
                     ["xclip", "-selection", "clipboard"],
                     input=text,
                     check=True,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     text=True,
                     timeout=5,
                 )
@@ -355,14 +428,14 @@ class TextInjector:
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 logger.warning(f"xclip failed: {e}")
 
-        # Try xsel as last resort
         if shutil.which("xsel"):
             try:
                 subprocess.run(
                     ["xsel", "--clipboard", "--input"],
                     input=text,
                     check=True,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     text=True,
                     timeout=5,
                 )
@@ -376,6 +449,65 @@ class TextInjector:
             "to enable clipboard functionality."
         )
         return False
+
+    def _read_clipboard(self) -> Optional[bytes]:
+        """Read current clipboard content as raw bytes.
+
+        Used to save state before clipboard-paste injection so we can
+        restore it afterward. Returns None on empty clipboard or error.
+        """
+        if shutil.which("wl-paste"):
+            try:
+                result = subprocess.run(
+                    ["wl-paste", "--no-newline"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+                if result.returncode == 0 and result.stdout:
+                    return result.stdout
+            except subprocess.TimeoutExpired:
+                logger.debug("wl-paste timed out reading clipboard")
+        elif shutil.which("xclip"):
+            try:
+                result = subprocess.run(
+                    ["xclip", "-selection", "clipboard", "-out"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+                if result.returncode == 0 and result.stdout:
+                    return result.stdout
+            except subprocess.TimeoutExpired:
+                logger.debug("xclip timed out reading clipboard")
+        return None
+
+    def _write_clipboard_bytes(self, data: Optional[bytes]) -> None:
+        """Restore clipboard content. Clears clipboard when data is None/empty."""
+        if not shutil.which("wl-copy"):
+            return
+        try:
+            if not data:
+                subprocess.run(
+                    ["wl-copy", "--clear"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+            else:
+                subprocess.run(
+                    ["wl-copy"],
+                    input=data,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired:
+            logger.debug("Clipboard restore timed out")
 
     def _should_copy_to_clipboard(self) -> bool:
         """Check if copy-to-clipboard setting is enabled."""
@@ -419,12 +551,16 @@ class TextInjector:
         try:
             result = subprocess.run(
                 [
-                    "gdbus", "call", "--session",
+                    "gdbus",
+                    "call",
+                    "--session",
                     "--dest=org.gnome.Shell",
                     "--object-path=/org/gnome/Shell/Extensions/Windows",
                     "--method=org.gnome.Shell.Extensions.Windows.List",
                 ],
-                capture_output=True, text=True, timeout=1,
+                capture_output=True,
+                text=True,
+                timeout=1,
             )
             # gdbus returns: ('[{"wm_class":"...","focus":true,...},...]',)
             match = re.search(r"'(\[.*\])'", result.stdout, re.DOTALL)
@@ -441,11 +577,8 @@ class TextInjector:
         """Return matching wm_class if active window is in ydotool_apps override list."""
         try:
             from ..ui.config_manager import ConfigManager
-            patterns = (
-                ConfigManager()
-                .config.get("text_injection", {})
-                .get("ydotool_apps", [])
-            )
+
+            patterns = ConfigManager().config.get("text_injection", {}).get("ydotool_apps", [])
             if not patterns:
                 return None
             wm_class = self._get_active_window_wm_class()
@@ -463,15 +596,21 @@ class TextInjector:
         """Inject text via ydotool, bypassing the auto-selected environment.
 
         Used for per-app overrides. Requires ydotoold daemon running.
+        Non-ASCII text routes through clipboard + Ctrl+V because ydotool's
+        evdev keycodes only cover US ASCII. The clipboard is saved before
+        and restored after so the user's clipboard remains untouched.
         """
+        if self._has_non_ascii(text):
+            return self._inject_via_clipboard_paste_with_restore(text)
         try:
             env = os.environ.copy()
-            env.setdefault(
-                "YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket"
-            )
+            env.setdefault("YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket")
             subprocess.run(
                 ["ydotool", "type", "--", text],
-                env=env, check=True, timeout=10, stderr=subprocess.PIPE,
+                env=env,
+                check=True,
+                timeout=10,
+                stderr=subprocess.PIPE,
             )
             logger.info("Text injection completed via per-app ydotool override")
             return True
@@ -482,6 +621,49 @@ class TextInjector:
         except Exception as e:
             logger.error(f"ydotool override error: {e}")
             return False
+
+    def _inject_via_clipboard_paste_with_restore(self, text: str) -> bool:
+        """Clipboard-paste injection that saves and restores the clipboard.
+
+        Used by per-app override for non-ASCII text. Steps:
+          1. Snapshot current clipboard content
+          2. Place our text on the clipboard
+          3. Simulate Ctrl+V via ydotool key
+          4. Wait briefly so the focused app actually reads the clipboard
+          5. Restore the snapshotted content (or clear if it was empty)
+        """
+        saved = self._read_clipboard()
+
+        if not self._copy_to_clipboard(text):
+            logger.warning("Could not copy text to clipboard for paste injection")
+            self._write_clipboard_bytes(saved)
+            return False
+
+        success = False
+        try:
+            env = os.environ.copy()
+            env.setdefault("YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket")
+            subprocess.run(
+                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+                env=env,
+                check=True,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            logger.info(
+                f"Text injected via clipboard paste + restore: '{text[:20]}...' "
+                f"({len(text)} chars)"
+            )
+            # Give the focused app time to actually paste before we overwrite
+            # the clipboard with the restored content.
+            time.sleep(0.3)
+            success = True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"Paste simulation failed: {e}")
+        finally:
+            self._write_clipboard_bytes(saved)
+
+        return success
 
     def inject_text(self, text: str) -> bool:
         """
@@ -578,13 +760,16 @@ class TextInjector:
         except Exception as e:
             logger.error(f"Failed to inject text: {e}", exc_info=True)
 
-            try:
-                if self._copy_to_clipboard(text):
-                    logger.info("Text copied to clipboard as fallback - user can paste manually")
-                    self._show_clipboard_fallback_notification()
-                    return True
-            except Exception as clipboard_error:
-                logger.debug(f"Clipboard fallback also failed: {clipboard_error}")
+            if self._should_copy_to_clipboard():
+                try:
+                    if self._copy_to_clipboard(text):
+                        logger.info(
+                            "Text copied to clipboard as fallback - user can paste manually"
+                        )
+                        self._show_clipboard_fallback_notification()
+                        return True
+                except Exception as clipboard_error:
+                    logger.debug(f"Clipboard fallback also failed: {clipboard_error}")
 
             try:
                 from ..ui.audio_feedback import play_error_sound
@@ -629,8 +814,16 @@ class TextInjector:
                     check=False,
                 )
 
-                if active_window.returncode == 0 and active_window.stdout.strip():
+                if self._target_x11_window_id:
+                    window_id = self._target_x11_window_id
+                    logger.info(f"Using captured target X11 window: {window_id}")
+                elif active_window.returncode == 0 and active_window.stdout.strip():
                     window_id = active_window.stdout.strip()
+                    logger.info(f"Using current active X11 window: {window_id}")
+                else:
+                    window_id = None
+
+                if window_id:
                     # Focus explicitly on that window
                     subprocess.run(
                         ["xdotool", "windowactivate", "--sync", window_id],
@@ -726,49 +919,6 @@ class TextInjector:
         except UnicodeEncodeError:
             return True
 
-    def _inject_via_clipboard_paste(self, text: str) -> bool:
-        """
-        Inject text by copying to clipboard and simulating Ctrl+V with ydotool.
-
-        This is the workaround for ydotool's inability to type non-ASCII/Unicode
-        characters (accented letters, CJK, etc.) because ydotool simulates evdev
-        key events which only cover US ASCII keycodes. See issue #362.
-
-        Note: this temporarily overwrites the user's clipboard. There is no
-        attempt to restore it afterward, as there is no safe race-free way to
-        do so on Wayland.
-
-        Returns:
-            True if successful, False otherwise
-        """
-        logger.debug(
-            "Using clipboard-paste injection for non-ASCII text "
-            "(user clipboard will be temporarily overwritten)"
-        )
-
-        if not self._copy_to_clipboard(text):
-            logger.warning("Could not copy text to clipboard for paste injection")
-            return False
-
-        # Simulate Ctrl+V via ydotool using evdev keycodes:
-        # KEY_LEFTCTRL=29, KEY_V=47; value 1=press, 0=release.
-        # wtype is intentionally not handled here: wtype uses the Wayland
-        # virtual-keyboard protocol which supports Unicode natively, so it
-        # never needs the clipboard-paste workaround.
-        try:
-            subprocess.run(
-                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
-                check=True,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=3,
-            )
-            logger.info(f"Text injected via clipboard paste: '{text[:20]}...' ({len(text)} chars)")
-            return True
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            logger.warning(f"Paste simulation failed: {e}")
-            return False
-
     def _inject_with_wayland_tool(self, text: str):
         """
         Inject text using a Wayland-compatible tool (wtype or ydotool).
@@ -784,27 +934,21 @@ class TextInjector:
         Raises:
             subprocess.CalledProcessError: If the tool fails, with stderr captured
         """
-        # ydotool can only handle ASCII characters because it works at the
-        # evdev keycode level. For non-ASCII text, use clipboard paste instead.
-        if self.wayland_tool == "ydotool" and self._has_non_ascii(text):
-            logger.info(
-                "Text contains non-ASCII characters, using clipboard paste "
-                "for ydotool (evdev keycodes are ASCII-only)"
-            )
-            if self._inject_via_clipboard_paste(text):
-                return
-            logger.warning(
-                "Clipboard paste failed, falling back to ydotool type "
-                "(non-ASCII characters may be dropped)"
-            )
-
+        env = os.environ.copy()
         if self.wayland_tool == "wtype":
             cmd = ["wtype", text]
         else:  # ydotool
-            cmd = ["ydotool", "type", text]
+            env.setdefault("YDOTOOL_SOCKET", f"/run/user/{os.getuid()}/.ydotool_socket")
+            if self._has_non_ascii(text):
+                raise subprocess.CalledProcessError(
+                    1,
+                    ["ydotool", "type", "--", text],
+                    stderr="ydotool cannot type Unicode text without dropping characters",
+                )
+            cmd = ["ydotool", "type", "--", text]
 
         try:
-            subprocess.run(cmd, check=True, stderr=subprocess.PIPE, text=True)
+            subprocess.run(cmd, env=env, check=True, stderr=subprocess.PIPE, text=True)
         except subprocess.CalledProcessError as e:
             # Re-raise with stderr preserved for better diagnostics
             raise subprocess.CalledProcessError(
@@ -897,13 +1041,14 @@ class TextInjector:
     def _log_current_window_info(self):
         """Log information about the current window/application for debugging."""
         try:
+            wm_class = self._get_active_window_wm_class()
+            if wm_class:
+                logger.info(f"Focused Wayland window class: {wm_class}")
             if (
                 self.environment == DesktopEnvironment.X11
                 or self.environment == DesktopEnvironment.WAYLAND_XDOTOOL
             ):
                 self._log_x11_window_info()
-            else:
-                logger.debug("Window info logging not available for pure Wayland")
         except Exception as e:
             logger.debug(f"Could not get window info: {e}")
 

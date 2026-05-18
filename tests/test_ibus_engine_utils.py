@@ -280,5 +280,85 @@ class TestStopEngineProcess(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestFindEngineProcesses(unittest.TestCase):
+    """Tests for _find_engine_processes orphan detection."""
+
+    @patch("vocalinux.text_injection.ibus_engine.Path")
+    @patch("vocalinux.text_injection.ibus_engine.os.listdir")
+    @patch("vocalinux.text_injection.ibus_engine.os.getpid", return_value=9999)
+    def test_finds_orphan_engines_by_cmdline(self, _mock_pid, mock_listdir, mock_path):
+        """Returns PIDs of processes whose cmdline matches ibus_engine.py vocalinux."""
+        from vocalinux.text_injection.ibus_engine import _find_engine_processes
+
+        mock_listdir.return_value = ["1000", "2000", "3000", "self", "9999"]
+
+        # Each Path("/proc") / "<pid>" / "cmdline" call returns a mock with .read_text()
+        cmdlines = {
+            "1000": "python /some/path/ibus_engine.py vocalinux",  # match
+            "2000": "python /unrelated/process.py",  # skip
+            "3000": "ibus-daemon --panel disable",  # skip (no ibus_engine.py)
+        }
+
+        def path_factory(arg):
+            mock = MagicMock()
+            mock.__truediv__ = lambda self, other: path_factory(f"{arg}/{other}")
+            if arg.endswith("/cmdline"):
+                pid = arg.split("/")[-2]
+                if pid in cmdlines:
+                    mock.read_text.return_value = cmdlines[pid]
+                else:
+                    mock.read_text.side_effect = FileNotFoundError
+            return mock
+
+        mock_path.side_effect = path_factory
+
+        result = _find_engine_processes()
+        self.assertEqual(result, [1000])
+
+    @patch("vocalinux.text_injection.ibus_engine.os.listdir")
+    @patch("vocalinux.text_injection.ibus_engine.os.getpid", return_value=9999)
+    def test_excludes_self_and_provided_pids(self, _mock_pid, mock_listdir):
+        """Excludes own PID and any PID passed via exclude_pids."""
+        from vocalinux.text_injection.ibus_engine import _find_engine_processes
+
+        mock_listdir.return_value = ["9999", "5555"]
+        result = _find_engine_processes(exclude_pids=(5555,))
+        self.assertEqual(result, [])
+
+    @patch("vocalinux.text_injection.ibus_engine.os.listdir", side_effect=OSError("nope"))
+    def test_oserror_returns_empty_list(self, _mock_listdir):
+        """Falls back to empty list when /proc isn't available."""
+        from vocalinux.text_injection.ibus_engine import _find_engine_processes
+
+        self.assertEqual(_find_engine_processes(), [])
+
+
+class TestStopEngineProcessOrphanCleanup(unittest.TestCase):
+    """Tests for stop_engine_process orphan-cleanup behavior."""
+
+    @patch("vocalinux.text_injection.ibus_engine.SOCKET_PATH")
+    @patch("vocalinux.text_injection.ibus_engine._kill_pid")
+    @patch(
+        "vocalinux.text_injection.ibus_engine._find_engine_processes",
+        return_value=[1241209, 1241210],
+    )
+    @patch("vocalinux.text_injection.ibus_engine.PID_FILE")
+    def test_kills_orphans_when_no_pid_file(
+        self, mock_pid_file, mock_find, mock_kill, mock_socket
+    ):
+        """When PID file is absent, still scans /proc and kills orphan engines."""
+        from vocalinux.text_injection.ibus_engine import stop_engine_process
+
+        mock_pid_file.exists.return_value = False
+        mock_socket.exists.return_value = False
+
+        stop_engine_process()
+
+        mock_find.assert_called_once_with(exclude_pids=())
+        kill_calls = [c.args[0] for c in mock_kill.call_args_list]
+        self.assertIn(1241209, kill_calls)
+        self.assertIn(1241210, kill_calls)
+
+
 if __name__ == "__main__":
     unittest.main()
